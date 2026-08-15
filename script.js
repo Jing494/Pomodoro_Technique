@@ -1,0 +1,552 @@
+(function() {
+    'use strict';
+
+    // ==================== 数据存储 ====================
+    const NICKNAME_KEY = 'pomodoro_nickname';
+    const RECORDS_KEY = 'pomodoro_records';
+    const SETTINGS_KEY = 'pomodoro_work_rest_settings';
+    const CYCLE_KEY = 'pomodoro_auto_cycle';
+
+    const DEFAULT_SETTINGS = { workMinutes: 25, restMinutes: 5 };
+
+    let nickname = localStorage.getItem(NICKNAME_KEY) || '专注者';
+    let records = [];
+    try { records = JSON.parse(localStorage.getItem(RECORDS_KEY)) || []; } catch(e) { records = []; }
+    let settings = { ...DEFAULT_SETTINGS };
+    try { const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)); if (saved && saved.workMinutes) settings = saved; } catch(e) {}
+    let autoCycle = localStorage.getItem(CYCLE_KEY) === 'true';
+
+    function saveRecords() { localStorage.setItem(RECORDS_KEY, JSON.stringify(records)); }
+    function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+    function saveCycle() { localStorage.setItem(CYCLE_KEY, autoCycle.toString()); }
+
+    function calculateTomatoes(totalMinutes) { return Math.floor(totalMinutes / 30); }
+    function calculateLevel(tomatoes) {
+        if (tomatoes >= 10000) return 6;
+        if (tomatoes >= 1000) return 5;
+        if (tomatoes >= 200) return 4;
+        if (tomatoes >= 100) return 3;
+        if (tomatoes >= 50) return 2;
+        if (tomatoes >= 20) return 1;
+        return 0;
+    }
+    function getTotalFocusMinutes() { return records.reduce((sum, r) => sum + (r.minutes || 0), 0); }
+    function getTomatoCount() { return calculateTomatoes(getTotalFocusMinutes()); }
+    function getLevel() { return calculateLevel(getTomatoCount()); }
+
+    // ==================== 番茄钟状态 ====================
+    const state = {
+        mode: 'work',
+        workMinutes: settings.workMinutes,
+        restMinutes: settings.restMinutes,
+        totalSeconds: settings.workMinutes * 60,
+        remainingSeconds: settings.workMinutes * 60,
+        isRunning: false,
+        isPaused: false,
+        presetMinutes: settings.workMinutes,
+        soundEnabled: true,
+        timerId: null,
+        lastTickTime: 0,
+        accumulatedPauseMs: 0,
+        pauseStartTime: 0,
+        totalDurationMs: settings.workMinutes * 60 * 1000,
+    };
+
+    // DOM元素
+    const timerSubview = document.getElementById('timerSubview');
+    const statsSubview = document.getElementById('statsSubview');
+    const settingsSubview = document.getElementById('settingsSubview');
+    const navBtns = document.querySelectorAll('.nav-btn');
+    const btnSound = document.getElementById('btnSound');
+    const btnStart = document.getElementById('btnStart');
+    const btnReset = document.getElementById('btnReset');
+    const cycleToggle = document.getElementById('cycleToggle');
+    const timerDisplay = document.getElementById('timerDisplay');
+    const timerLabel = document.getElementById('timerLabel');
+    const ringProgress = document.getElementById('ringProgress');
+    const presetContainer = document.getElementById('presetContainer');
+    const countValueEl = document.getElementById('countValue');
+    const tomatoCountEl = document.getElementById('tomatoCount');
+    const homeNickname = document.getElementById('homeNickname');
+    const levelBadge = document.getElementById('levelBadge');
+    const celebrationOverlay = document.getElementById('celebrationOverlay');
+    const successOverlay = document.getElementById('successOverlay');
+    const btnCloseSuccess = document.getElementById('btnCloseSuccess');
+    const successMessage = document.getElementById('successMessage');
+    const celebrationSubText = document.getElementById('celebrationSubText');
+
+    const totalMinutesEl = document.getElementById('totalMinutes');
+    const totalTomatoesEl = document.getElementById('totalTomatoes');
+    const levelDisplayEl = document.getElementById('levelDisplay');
+    const recordListEl = document.getElementById('recordList');
+
+    const nicknameInput = document.getElementById('nicknameInput');
+    const btnSaveNickname = document.getElementById('btnSaveNickname');
+    const nicknameError = document.getElementById('nicknameError');
+    const nicknameSuccess = document.getElementById('nicknameSuccess');
+
+    const workMinutesInput = document.getElementById('workMinutesInput');
+    const restMinutesInput = document.getElementById('restMinutesInput');
+    const btnSaveWorkRest = document.getElementById('btnSaveWorkRest');
+    const workRestError = document.getElementById('workRestError');
+    const workRestSuccess = document.getElementById('workRestSuccess');
+
+    const RING_CIRCUMFERENCE = 785.4;
+
+    let successTimeout = null;
+
+    // ==================== 更新UI函数 ====================
+    function formatTime(totalSeconds) {
+        const secs = Math.max(0, Math.floor(totalSeconds));
+        const hours = Math.floor(secs / 3600);
+        const minutes = Math.floor((secs % 3600) / 60);
+        const seconds = secs % 60;
+        if (hours > 0) return `${hours}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
+        return `${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`;
+    }
+
+    function updateDisplay() {
+        timerDisplay.textContent = formatTime(state.remainingSeconds);
+        timerDisplay.classList.toggle('small', state.remainingSeconds >= 3600);
+        const ratio = state.totalSeconds > 0 ? state.remainingSeconds / state.totalSeconds : 0;
+        timerDisplay.classList.remove('warning','danger');
+        if (state.isRunning || state.isPaused) {
+            if (ratio <= 0.1 && state.remainingSeconds > 0) timerDisplay.classList.add('danger');
+            else if (ratio <= 0.25 && state.remainingSeconds > 0) timerDisplay.classList.add('warning');
+        }
+        if (state.mode === 'rest') {
+            timerLabel.textContent = state.isRunning ? '休息中' : state.isPaused ? '休息暂停' : '休息时间';
+            timerLabel.classList.add('rest');
+            timerDisplay.style.color = 'var(--rest-green)';
+        } else {
+            timerLabel.textContent = state.isRunning ? '专注中' : state.isPaused ? '已暂停' : '剩余时间';
+            timerLabel.classList.remove('rest');
+            timerDisplay.style.color = 'var(--text-primary)';
+        }
+        document.title = state.isRunning ? `⏱ ${formatTime(state.remainingSeconds)} (${state.mode === 'rest' ? '休息' : '专注'})` : '🍅 番茄钟';
+    }
+
+    function updateRing() {
+        const ratio = state.totalSeconds > 0 ? state.remainingSeconds / state.totalSeconds : 0;
+        const offset = RING_CIRCUMFERENCE * (1 - ratio);
+        ringProgress.setAttribute('stroke-dashoffset', offset);
+        ringProgress.classList.remove('warning','danger','rest');
+        if (state.mode === 'rest') {
+            ringProgress.classList.add('rest');
+        } else {
+            if (state.isRunning || state.isPaused) {
+                if (ratio <= 0.1 && state.remainingSeconds > 0) ringProgress.classList.add('danger');
+                else if (ratio <= 0.25 && state.remainingSeconds > 0) ringProgress.classList.add('warning');
+            }
+        }
+        if (state.remainingSeconds <= 0) ringProgress.classList.remove('warning','danger');
+    }
+
+    function updatePresetButtons() {
+        document.querySelectorAll('.preset-btn').forEach(btn => {
+            const min = parseInt(btn.dataset.minutes, 10);
+            btn.classList.toggle('active', min === state.workMinutes);
+        });
+    }
+
+    function updateStartButton() {
+        if (state.isRunning) {
+            btnStart.textContent = '⏸ 暂停';
+            btnStart.classList.add('paused');
+        } else if (state.isPaused) {
+            btnStart.textContent = '▶ 继续';
+            btnStart.classList.add('paused');
+        } else {
+            btnStart.textContent = '▶ 开始';
+            btnStart.classList.remove('paused');
+        }
+    }
+
+    function updateSoundButton() { btnSound.textContent = state.soundEnabled ? '🔊' : '🔇'; }
+
+    function updateCycleButton() {
+        cycleToggle.classList.toggle('active', autoCycle);
+        cycleToggle.textContent = autoCycle ? '🔁 循环开' : '🔁 循环关';
+    }
+
+    function updateLevelAndStats() {
+        const totalMinutes = getTotalFocusMinutes();
+        const tomatoes = getTomatoCount();
+        const level = getLevel();
+        countValueEl.textContent = tomatoes;
+        levelBadge.textContent = `⭐ LV${level}`;
+        totalMinutesEl.textContent = totalMinutes;
+        totalTomatoesEl.textContent = tomatoes;
+        levelDisplayEl.textContent = `LV${level}`;
+    }
+
+    function updateStatsAndRecords() {
+        updateLevelAndStats();
+        recordListEl.innerHTML = '';
+        if (records.length === 0) {
+            recordListEl.innerHTML = '<div class="empty-records">暂无记录，开始第一个番茄吧！</div>';
+            return;
+        }
+        const sorted = [...records].sort((a, b) => b.timestamp - a.timestamp);
+        sorted.forEach(record => {
+            const item = document.createElement('div');
+            item.className = 'record-item';
+            const dateStr = new Date(record.timestamp).toLocaleString('zh-CN', {
+                month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+            });
+            item.innerHTML = `<span class="date">${dateStr}</span><span class="duration">${record.minutes} 分钟</span>`;
+            recordListEl.appendChild(item);
+        });
+    }
+
+    function updateNicknameDisplay() {
+        homeNickname.textContent = `👤 ${nickname}`;
+        nicknameInput.value = nickname;
+    }
+
+    function updateAllUI() {
+        updateDisplay();
+        updateRing();
+        updatePresetButtons();
+        updateStartButton();
+        updateSoundButton();
+        updateCycleButton();
+        updateLevelAndStats();
+        updateNicknameDisplay();
+    }
+
+    // ==================== 昵称逻辑 ====================
+    btnSaveNickname.addEventListener('click', () => {
+        const newNickname = nicknameInput.value.trim();
+        if (!newNickname) {
+            nicknameError.textContent = '请输入昵称';
+            nicknameSuccess.textContent = '';
+            return;
+        }
+        nickname = newNickname;
+        localStorage.setItem(NICKNAME_KEY, nickname);
+        updateNicknameDisplay();
+        nicknameError.textContent = '';
+        nicknameSuccess.textContent = '昵称已保存';
+        showSuccess('昵称保存成功', '耶耶耶太好了');
+        setTimeout(() => { nicknameSuccess.textContent = ''; }, 2000);
+    });
+
+    // ==================== 工作/休息设置 ====================
+    function loadSettingsToInputs() {
+        workMinutesInput.value = settings.workMinutes;
+        restMinutesInput.value = settings.restMinutes;
+    }
+
+    btnSaveWorkRest.addEventListener('click', () => {
+        const wm = parseInt(workMinutesInput.value, 10);
+        const rm = parseInt(restMinutesInput.value, 10);
+        if (isNaN(wm) || wm <= 0 || isNaN(rm) || rm <= 0) {
+            workRestError.textContent = '请输入有效的分钟数';
+            workRestSuccess.textContent = '';
+            return;
+        }
+        if (wm > 180) { workRestError.textContent = '工作分钟数不能超过180'; return; }
+        if (rm > 60) { workRestError.textContent = '休息分钟数不能超过60'; return; }
+        settings.workMinutes = wm;
+        settings.restMinutes = rm;
+        saveSettings();
+        state.workMinutes = wm;
+        state.restMinutes = rm;
+        if (state.mode === 'work') {
+            state.totalSeconds = wm * 60;
+            state.totalDurationMs = wm * 60 * 1000;
+            if (!state.isRunning && !state.isPaused) {
+                state.remainingSeconds = state.totalSeconds;
+            }
+        } else {
+            state.totalSeconds = rm * 60;
+            state.totalDurationMs = rm * 60 * 1000;
+            if (!state.isRunning && !state.isPaused) {
+                state.remainingSeconds = state.totalSeconds;
+            }
+        }
+        updatePresetButtons();
+        updateDisplay();
+        updateRing();
+        workRestError.textContent = '';
+        workRestSuccess.textContent = '设置已保存';
+        showSuccess('设置已保存', '工作/休息时间已更新');
+        setTimeout(() => { workRestSuccess.textContent = ''; }, 2000);
+    });
+
+    // ==================== 循环开关 ====================
+    cycleToggle.addEventListener('click', () => {
+        autoCycle = !autoCycle;
+        saveCycle();
+        updateCycleButton();
+    });
+
+    // ==================== 计时逻辑 ====================
+    function setMode(mode) {
+        state.mode = mode;
+        if (mode === 'work') {
+            state.totalSeconds = state.workMinutes * 60;
+            state.totalDurationMs = state.workMinutes * 60 * 1000;
+        } else {
+            state.totalSeconds = state.restMinutes * 60;
+            state.totalDurationMs = state.restMinutes * 60 * 1000;
+        }
+        state.remainingSeconds = state.totalSeconds;
+        state.isRunning = false;
+        state.isPaused = false;
+        stopTimerInterval();
+        updateStartButton();
+        updateDisplay();
+        updateRing();
+    }
+
+    function startTimer() {
+        if (state.isRunning) return;
+        if (state.remainingSeconds <= 0) {
+            resetTimer();
+        }
+        state.isRunning = true;
+        state.isPaused = false;
+        state.lastTickTime = Date.now();
+        state.accumulatedPauseMs = 0;
+        updateStartButton();
+        updateDisplay();
+        if (state.timerId) clearInterval(state.timerId);
+        state.timerId = setInterval(tick, 200);
+        hideCelebration();
+    }
+
+    function pauseTimer() {
+        if (!state.isRunning) return;
+        state.isRunning = false;
+        state.isPaused = true;
+        state.pauseStartTime = Date.now();
+        stopTimerInterval();
+        updateStartButton();
+        updateDisplay();
+    }
+
+    function resumeTimer() {
+        if (state.isRunning || !state.isPaused) return;
+        state.isRunning = true;
+        state.isPaused = false;
+        state.accumulatedPauseMs += Date.now() - state.pauseStartTime;
+        state.lastTickTime = Date.now();
+        updateStartButton();
+        updateDisplay();
+        if (state.timerId) clearInterval(state.timerId);
+        state.timerId = setInterval(tick, 200);
+    }
+
+    function resetTimer() {
+        stopTimerInterval();
+        state.isRunning = false;
+        state.isPaused = false;
+        setMode(state.mode);
+        hideCelebration();
+        updateStartButton();
+        updateDisplay();
+        updateRing();
+    }
+
+    function stopTimerInterval() {
+        if (state.timerId) {
+            clearInterval(state.timerId);
+            state.timerId = null;
+        }
+    }
+
+    function tick() {
+        const now = Date.now();
+        const elapsedMs = (now - state.lastTickTime) + state.accumulatedPauseMs;
+        const remainingMs = state.totalDurationMs - elapsedMs;
+        state.remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+        updateDisplay();
+        updateRing();
+        if (remainingMs <= 0) {
+            state.remainingSeconds = 0;
+            completeCurrentPhase();
+        }
+    }
+
+    function completeCurrentPhase() {
+        stopTimerInterval();
+        state.isRunning = false;
+        state.isPaused = false;
+        updateStartButton();
+
+        if (state.mode === 'work') {
+            const focusMinutes = state.workMinutes;
+            records.push({
+                date: new Date().toISOString(),
+                minutes: focusMinutes,
+                timestamp: Date.now()
+            });
+            saveRecords();
+            updateStatsAndRecords();
+            const tomatoes = getTomatoCount();
+            countValueEl.textContent = tomatoes;
+            tomatoCountEl.classList.remove('bump');
+            void tomatoCountEl.offsetWidth;
+            tomatoCountEl.classList.add('bump');
+            if (state.soundEnabled) playCompletionSound();
+
+            if (autoCycle) {
+                setMode('rest');
+                showCelebration('休息时间', '休息一下吧');
+                startTimer();
+            } else {
+                showCelebration('时间到！', '干得漂亮，休息一下吧');
+                resetTimer();
+            }
+        } else if (state.mode === 'rest') {
+            if (state.soundEnabled) playCompletionSound();
+            if (autoCycle) {
+                setMode('work');
+                showCelebration('休息结束', '开始新的专注吧');
+                startTimer();
+            } else {
+                showCelebration('休息结束', '准备下一次专注吧');
+                resetTimer();
+            }
+        }
+    }
+
+    function showCelebration(title, subText) {
+        celebrationOverlay.querySelector('.text').textContent = title;
+        celebrationSubText.textContent = subText || '';
+        celebrationOverlay.classList.add('active');
+    }
+    function hideCelebration() { celebrationOverlay.classList.remove('active'); }
+
+    function showSuccess(title, msg) {
+        successOverlay.querySelector('.text').textContent = title;
+        successMessage.textContent = msg || '耶耶耶太好了';
+        successOverlay.classList.add('active');
+        if (successTimeout) clearTimeout(successTimeout);
+        successTimeout = setTimeout(() => {
+            successOverlay.classList.remove('active');
+        }, 3000);
+    }
+    function hideSuccessOverlay() {
+        successOverlay.classList.remove('active');
+        if (successTimeout) clearTimeout(successTimeout);
+    }
+    btnCloseSuccess.addEventListener('click', hideSuccessOverlay);
+
+    // 声音
+    let audioContext = null;
+    function getAudioContext() {
+        if (!audioContext) {
+            try { audioContext = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) { audioContext = null; }
+        }
+        return audioContext;
+    }
+    function playCompletionSound() {
+        try {
+            const ctx = getAudioContext();
+            if (!ctx) return;
+            if (ctx.state === 'suspended') ctx.resume();
+            const notes = [
+                { freq: 523.25, time: 0, duration: 0.25 },
+                { freq: 659.25, time: 0.18, duration: 0.25 },
+                { freq: 783.99, time: 0.36, duration: 0.4 },
+            ];
+            notes.forEach(note => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(note.freq, ctx.currentTime + note.time);
+                gain.gain.setValueAtTime(0, ctx.currentTime + note.time);
+                gain.gain.linearRampToValueAtTime(0.3, ctx.currentTime + note.time + 0.03);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + note.time + note.duration);
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.start(ctx.currentTime + note.time);
+                osc.stop(ctx.currentTime + note.time + note.duration + 0.05);
+            });
+        } catch(e) {}
+    }
+
+    // ==================== 预设按钮 ====================
+    presetContainer.addEventListener('click', (e) => {
+        const btn = e.target.closest('.preset-btn');
+        if (!btn) return;
+        const minutes = parseInt(btn.dataset.minutes, 10);
+        state.workMinutes = minutes;
+        settings.workMinutes = minutes;
+        saveSettings();
+        if (state.mode === 'work' && !state.isRunning && !state.isPaused) {
+            state.totalSeconds = minutes * 60;
+            state.totalDurationMs = minutes * 60 * 1000;
+            state.remainingSeconds = state.totalSeconds;
+        }
+        updatePresetButtons();
+        updateDisplay();
+        updateRing();
+        workMinutesInput.value = minutes;
+    });
+
+    // ==================== 控制按钮 ====================
+    btnStart.addEventListener('click', () => {
+        if (state.isRunning) pauseTimer();
+        else if (state.isPaused) resumeTimer();
+        else startTimer();
+    });
+
+    btnReset.addEventListener('click', resetTimer);
+
+    btnSound.addEventListener('click', () => {
+        state.soundEnabled = !state.soundEnabled;
+        updateSoundButton();
+        if (state.soundEnabled) playCompletionSound();
+    });
+
+    // ==================== 视图切换 ====================
+    function showTimerView() {
+        timerSubview.style.display = 'block';
+        statsSubview.style.display = 'none';
+        settingsSubview.style.display = 'none';
+        navBtns.forEach(btn => btn.classList.toggle('active', btn.dataset.view === 'timer'));
+    }
+    function showStatsView() {
+        timerSubview.style.display = 'none';
+        statsSubview.style.display = 'flex';
+        settingsSubview.style.display = 'none';
+        navBtns.forEach(btn => btn.classList.toggle('active', btn.dataset.view === 'stats'));
+        updateStatsAndRecords();
+    }
+    function showSettingsView() {
+        timerSubview.style.display = 'none';
+        statsSubview.style.display = 'none';
+        settingsSubview.style.display = 'flex';
+        navBtns.forEach(btn => btn.classList.toggle('active', btn.dataset.view === 'settings'));
+        loadSettingsToInputs();
+        nicknameInput.value = nickname;
+        nicknameError.textContent = '';
+        nicknameSuccess.textContent = '';
+    }
+
+    navBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const view = btn.dataset.view;
+            if (view === 'timer') showTimerView();
+            else if (view === 'stats') showStatsView();
+            else if (view === 'settings') showSettingsView();
+        });
+    });
+
+    // ==================== 初始化 ====================
+    function init() {
+        state.workMinutes = settings.workMinutes;
+        state.restMinutes = settings.restMinutes;
+        state.totalSeconds = settings.workMinutes * 60;
+        state.remainingSeconds = state.totalSeconds;
+        state.totalDurationMs = settings.workMinutes * 60 * 1000;
+        updateAllUI();
+        updateStatsAndRecords();
+        showTimerView();
+    }
+
+    init();
+})();
